@@ -1,0 +1,325 @@
+#!/bin/bash
+
+###############################################################################
+#
+# openssl-gensconf - A program to create OpenVPN configuration files and keys.
+#
+# I looked around and I found several programs, but none were really very
+# suitable.  So I wrote my own.  It's pretty simple, but it does the job.
+#
+# SPDX-License-Identifier: GPL-2.0-only
+#
+###############################################################################
+
+if ! type -a easyrsa >/dev/null 2>&1; then
+	echo "easyrsa not found, you need to get it from"
+	echo "	https://github.com/OpenVPN/easy-rsa"
+	echo "and put it into your path."
+	echo "This is not the same thing as the easy-rsa package on"
+	echo "Ubuntu or other distros."
+	exit 1
+fi
+
+NL=$'\n'
+
+DEFAULT_OVPN_PORT=1194
+DEFAULT_OVPN_SUBNET="192.168.8.0 255.255.255.0"
+DEFAULT_OVPN_KEYSIZE="2048"
+DEFAULT_OVPN_SERVER_FILENAME="server"
+
+do_help() {
+	echo "This program creates keys and configuration files for use with"
+	echo "OpenVPN."
+	echo "To use this, create a directory and cd into it.  Then run the"
+	echo "program with the form:"
+	echo "  $0 [<client1> [<client2> ...]]"
+	echo "On the first run it will ask for configuration and"
+	echo "then generate server keys and configuration.  Then for each"
+	echo "parameter supplied it will generate a client .ovpn file."
+	echo
+	echo "The program will generate a tarball with the server config"
+	echo "It will tell you the filename.  Untar that in /etc/openvpn"
+	echo "on your target."
+	echo
+	echo "It will also create a .opvn file for each client with all"
+	echo "the keys and configuration in it.  OpenVPN knows how to use"
+	echo "these files, transfer them (securely) to the clients and"
+	echo "load them into OpenVPN."
+	echo
+	echo "NOTE: Do not run this on the OpenVPN server.  The CA key"
+	echo "is critical to keep a secret.  Do it on a secure internal"
+	echo "machine."
+	echo
+	echo "If you need to revoke certificates, you can use easyrsa"
+	echo "to create a crl.  Use the command:"
+	echo "  easyrsa revoke <client>"
+	echo "then run"
+	echo "  easyrsa gen-crl"
+	echo "Copy the crl.pem file created by easyrsa (it will tell you"
+	echo "the name) onto the server and replace the file"
+	echo "/etc/openvpn/<serverfile>-keys/crl.pem on the target."
+}
+
+if [ -n "$1" ]; then
+	if [ "$1" == '-h' -o "$1" == '--help' ]; then
+		do_help
+		exit 0
+	fi
+fi
+
+do_config() {
+	echo "The remote host name on the big internet the OpenVPN client will"
+	echo "connect to."
+	echo -n "OpenVPN server hostname or IP (required): "
+	read OVPN_SERVER
+	if [ -z "${OVPN_SERVER}" ]; then
+		echo "Server name is required" 1>&2
+		return 1
+	fi
+
+	echo
+	echo -n "OpenVPN port (default ${DEFAULT_OVPN_PORT}): "
+	read OVPN_PORT
+	if [ -z "${OVPN_PORT}" ]; then
+		OVPN_PORT=1194
+	fi
+
+	echo
+	echo "An unused subnet that OpenVPN will assign IP addresses from."
+	echo -n "OpenVPN subnet (default ${DEFAULT_OVPN_SUBNET}): "
+	read OVPN_SUBNET
+	if [ -z "${OVPN_SUBNET}" ]; then
+		OVPN_SUBNET="${DEFAULT_OVPN_SUBNET}"
+	fi
+
+	echo
+	echo "Local networks that OpenVPN will route clients to, in the"
+	echo "form \"192.168.1.0 255.255.255.0\".  Multiple may be listed,"
+	echo "enter an empty one to finish."
+	OVPN_ROUTES=""
+	echo -n "Route: "
+	read r
+	while [ -n "$r" ]; do
+		OVPN_ROUTES="${OVPN_ROUTES} $r"
+		echo -n "Route: "
+		read r
+	done
+
+	echo
+	echo "Route IPV6 traffic using this subnet."
+	echo -n "OpenVPN IPv6 subnet (optional): "
+	read OVPN_IPV6_SUBNET
+
+	OVPN_IPv6_ROUTES=""
+	if [ -n "${OVPN_IPV6_SUBNET}" ]; then
+		echo
+		echo "Local IPv6 networks that OpenVPN will route clients to, in the"
+		echo "standard nn:nn:nn::nn/nn form.  Multiple may be listed,"
+		echo "enter an empty one to finish."
+		echo -n "Route: "
+		read r
+		while [ -n "$r" ]; do
+			OVPN_IPV6_ROUTES="${OVPN_IPV6_ROUTES} $r"
+			echo -n "Route: "
+			read r
+		done
+	fi
+
+	echo
+	echo "DNS server on your internal network."
+	echo -n "OpenVPN DNS server (required): "
+	read OVPN_DNS_SERVER
+	if [ -z "${OVPN_DNS_SERVER}" ]; then
+		echo "DNS server is required" 1>&2
+		return 1
+	fi
+
+	echo
+	echo "Domain name of your internal network (for DNS)."
+	echo -n "OpenVPN domain name (required): "
+	read OVPN_DOMAIN
+	if [ -z "${OVPN_DOMAIN}" ]; then
+		echo "Domain is required" 1>&2
+		return 1
+	fi
+
+	echo
+	echo "The key length for keys.  This will onlny have an effect"
+	echo "when the PKI is created, you will need to delete everything"
+	echo "and start over if you want to change the key size."
+	echo -n "OpenVPN SSL keysize (default ${DEFAULT_OVPN_KEYSIZE}): "
+	read EASYRSA_KEY_SIZE
+	if [ -z "${EASYRSA_KEY_SIZE}" ]; then
+		EASYRSA_KEY_SIZE="${DEFAULT_OVPN_KEYSIZE}"
+	fi
+
+	echo
+	echo "The filename on the OpenVPN server for the configuration file"
+	echo -n "OpenVPN server file name (default ${DEFAULT_OVPN_SERVER_FILENAME}): "
+	read OVPN_SERVER_FILENAME
+	if [ -z "${OVPN_SERVER_FILENAME}" ]; then
+		OVPN_SERVER_FILENAME="${DEFAULT_OVPN_SERVER_FILENAME}"
+	fi
+
+	echo "OVPN_SERVER=\"${OVPN_SERVER}\"" >.ovpn.config
+	echo "OVPN_PORT=\"${OVPN_PORT}\"" >>.ovpn.config
+	echo "OVPN_SUBNET=\"${OVPN_SUBNET}\"" >>.ovpn.config
+	echo "OVPN_ROUTES=\"${OVPN_ROUTES}\"" >>.ovpn.config
+	echo "OVPN_IPV6_SUBNET=\"${OVPN_IPV6_SUBNET}\"" >>.ovpn.config
+	echo "OVPN_IPV6_ROUTES=\"${OVPN_IPV6_ROUTES}\"" >>.ovpn.config
+	echo "OVPN_DNS_SERVER=\"${OVPN_DNS_SERVER}\"" >>.ovpn.config
+	echo "OVPN_DOMAIN=\"${OVPN_DOMAIN}\"" >>.ovpn.config
+	echo "export EASYRSA_KEY_SIZE=\"${EASYRSA_KEY_SIZE}\"" >>.ovpn.config
+	echo "OVPN_SERVER_FILENAME=\"${OVPN_SERVER_FILENAME}\"" >>.ovpn.config
+}
+
+genroutes() {
+	while [ -n "$1" ]; do
+		addr="$1"
+		shift
+		if [ -z "$1" ]; then
+			echo "Invalid routes at $addr" 1>&2
+			return 1
+		fi
+		echo "push \"route ${addr} $1\"" >>"${OVPN_SERVER_FILENAME}".conf
+		shift
+	done
+}
+
+genipv6routes() {
+	while [ -n "$1" ]; do
+		echo "push \"ipv6-route $1\"" >>"${OVPN_SERVER_FILENAME}".conf
+		shift
+	done
+}
+
+genserver() {
+	if [ ! -e "${OVPN_SERVER_FILENAME}"-tc.pem ]; then
+		openvpn --genkey --secret "${OVPN_SERVER_FILENAME}"-tc.pem
+	fi
+	rm -rf tmpserver
+	mkdir tmpserver
+	cd tmpserver
+	mkdir "${OVPN_SERVER_FILENAME}"-keys
+	cd "${OVPN_SERVER_FILENAME}"-keys
+	openssl x509 -in ../../pki/ca.crt -out ca.crt
+	cp ../../pki/dh.pem .
+	openssl x509 -in ../../pki/issued/"${OVPN_SERVER_FILENAME}".crt -out server.crt
+	cp ../../pki/private/"${OVPN_SERVER_FILENAME}".key server.key
+	cp ../../"${OVPN_SERVER_FILENAME}"-tc.pem ./tc.pem
+	touch crl.pem
+	cd ..
+
+	cat <<EOF >"${OVPN_SERVER_FILENAME}".conf
+dev tun
+port ${OVPN_PORT}
+proto udp
+server ${OVPN_SUBNET}
+topology subnet
+client-to-client
+keepalive 10 60
+
+user nobody
+group nogroup
+persist-tun
+persist-key
+
+remote-cert-tls client
+compress lz4
+
+push "dhcp-option DNS ${OVPN_DNS_SERVER}"
+push "dhcp-option DOMAIN ${OVPN_DOMAIN}"
+push "compress lz4"
+
+dh "${OVPN_SERVER_FILENAME}-keys/dh.pem"
+ca "${OVPN_SERVER_FILENAME}-keys/ca.crt"
+crl-verify "${OVPN_SERVER_FILENAME}-keys/crl.pem"
+cert "${OVPN_SERVER_FILENAME}-keys/server.crt"
+key "${OVPN_SERVER_FILENAME}-keys/server.key"
+tls-crypt "${OVPN_SERVER_FILENAME}-keys/tc.pem"
+EOF
+	genroutes ${OVPN_ROUTES}
+
+	if [ -n "${OVPN_IPV6_SUBNET}" ]; then
+		echo "route-ipv6 ${OVPN_IPV6_SUBNET}" >>"${OVPN_SERVER_FILENAME}".conf
+	fi
+	genipv6routes ${OVPN_IPV6_ROUTES}
+
+	tar czf ../"${OVPN_SERVER_FILENAME}".tar.gz *
+	cd ..
+	rm -rf tmpserver
+
+	echo "${OVPN_SERVER_FILENAME}.tar.gz created, untar that in your"
+	echo "/etc/openvpn directory on your OpenVPN server"
+}
+
+genclient() {
+	rm -f pki/private/$1.key pki/issued/$1.crt pki/reqs/$1.req
+	easyrsa build-client-full "$1" nopass
+
+	OVPN_TC="$(sed -e "/^#/d;/^\w/N;s/\n//" "${OVPN_SERVER_FILENAME}"-tc.pem)"
+	OVPN_CA="$(openssl x509 -in pki/ca.crt)"
+	OVPN_KEY="$(cat pki/private/$1.key)"
+	OVPN_CERT="$(openssl x509 -in pki/issued/$1.crt)"
+
+	cat <<EOF >"$1".ovpn
+dev tun
+nobind
+client
+remote ${OVPN_SERVER} ${OVPN_PORT} udp
+auth-nocache
+remote-cert-tls server
+<ca>${NL}${OVPN_CA}${NL}</ca>
+<cert>${NL}${OVPN_CERT}${NL}</cert>
+<key>${NL}${OVPN_KEY}${NL}</key>
+<tls-crypt>${NL}${OVPN_TC}${NL}</tls-crypt>
+EOF
+}
+
+if [ ! -e .ovpn.config ]; then
+	echo "Configuration file not present, starting configuration."
+	if ! do_config; then
+		exit 1
+	fi
+fi
+
+. ./.ovpn.config
+
+if [ ! -e pki ]; then
+	if ! easyrsa init-pki; then
+		exit 1
+	fi
+fi
+
+if [ ! -e pki/dh.pem ]; then
+	if ! easyrsa gen-dh; then
+		exit 1
+	fi
+fi
+
+if [ ! -e pki/ca.crt ]; then
+	if ! easyrsa build-ca nopass; then
+		exit 1
+	fi
+fi
+
+if [ ! -e pki/issued/${OVPN_SERVER_FILENAME}.crt ]; then
+	if ! easyrsa build-server-full ${OVPN_SERVER_FILENAME} nopass; then
+		exit 1
+	fi
+fi
+
+if [ ! -e "${OVPN_SERVER_FILENAME}".tar.gz ]; then
+	genserver
+fi
+
+while [ -n "$1" ]; do
+	if [ -e "$1".ovpn ]; then
+		echo "$1.ovpn already exists"
+	else
+		genclient "$1"
+	fi
+	shift
+done
+
+exit 0
