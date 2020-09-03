@@ -20,6 +20,12 @@ if ! type -a easyrsa >/dev/null 2>&1; then
 	exit 1
 fi
 
+if ! type -a openvpn >/dev/null 2>&1; then
+	echo "OpenVPN must be installed on this host, even if you aren't"
+	echo "using it on this host.  It's required for generating some keys."
+	exit 1
+fi
+
 NL=$'\n'
 
 DEFAULT_OVPN_PORT=1194
@@ -188,7 +194,7 @@ genroutes() {
 
 genipv6routes() {
 	while [ -n "$1" ]; do
-		echo "push \"ipv6-route $1\"" >>"${OVPN_SERVER_FILENAME}".conf
+		echo "push \"route-ipv6 $1\"" >>"${OVPN_SERVER_FILENAME}".conf
 		shift
 	done
 }
@@ -204,10 +210,10 @@ genserver() {
 	cd "${OVPN_SERVER_FILENAME}"-keys
 	openssl x509 -in ../../pki/ca.crt -out ca.crt
 	cp ../../pki/dh.pem .
+	cp ../../pki/crl.pem .
 	openssl x509 -in ../../pki/issued/"${OVPN_SERVER_FILENAME}".crt -out server.crt
 	cp ../../pki/private/"${OVPN_SERVER_FILENAME}".key server.key
 	cp ../../"${OVPN_SERVER_FILENAME}"-tc.pem ./tc.pem
-	touch crl.pem
 	cd ..
 
 	cat <<EOF >"${OVPN_SERVER_FILENAME}".conf
@@ -241,7 +247,7 @@ EOF
 	genroutes ${OVPN_ROUTES}
 
 	if [ -n "${OVPN_IPV6_SUBNET}" ]; then
-		echo "route-ipv6 ${OVPN_IPV6_SUBNET}" >>"${OVPN_SERVER_FILENAME}".conf
+		echo "server-ipv6 ${OVPN_IPV6_SUBNET}" >>"${OVPN_SERVER_FILENAME}".conf
 	fi
 	genipv6routes ${OVPN_IPV6_ROUTES}
 
@@ -307,6 +313,7 @@ if [ ! -e pki/issued/${OVPN_SERVER_FILENAME}.crt ]; then
 	if ! easyrsa build-server-full ${OVPN_SERVER_FILENAME} nopass; then
 		exit 1
 	fi
+	easyrsa gen-crl
 fi
 
 if [ ! -e "${OVPN_SERVER_FILENAME}".tar.gz ]; then
